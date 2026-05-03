@@ -7,5 +7,3 @@ psycopg2-binary==2.9.9
 # OR async option:
 # asyncpg
 
-python-multipart==0.0.9
-requests==2.31.0
