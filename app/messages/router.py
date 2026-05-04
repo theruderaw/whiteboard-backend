@@ -1,6 +1,6 @@
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel
-from typing import List
+from typing import List, Optional
 from uuid import UUID
 from datetime import datetime
 from app.auth.dependencies import get_current_user
@@ -9,13 +9,16 @@ from app.crud import fetch_all, insert, database
 router = APIRouter(prefix="/messages", tags=["messages"])
 
 class MessageCreate(BaseModel):
-    receiver_id: UUID
     content: str
+    receiver_id: Optional[UUID] = None
+    room_id: Optional[UUID] = None
 
 class MessageResponse(BaseModel):
     id: UUID
     sender_id: UUID
-    receiver_id: UUID
+    sender_username: Optional[str] = None
+    receiver_id: Optional[UUID] = None
+    room_id: Optional[UUID] = None
     content: str
     timestamp: datetime
 
@@ -24,43 +27,54 @@ class MessageResponse(BaseModel):
 
 @router.post("/", response_model=MessageResponse)
 async def send_message(msg: MessageCreate, current_user: dict = Depends(get_current_user)):
-    # Check if receiver exists
-    receiver = await database.pool.fetchrow("SELECT id FROM users WHERE id = $1", msg.receiver_id)
-    if not receiver:
-        raise HTTPException(status_code=404, detail="Receiver not found")
-    
-    new_msg = await insert("messages", {
-        "sender_id": current_user["id"],
-        "receiver_id": msg.receiver_id,
-        "content": msg.content
-    })
+    if msg.room_id:
+        new_msg = await insert("messages", {
+            "sender_id": current_user["id"],
+            "room_id": msg.room_id,
+            "content": msg.content
+        })
+    elif msg.receiver_id:
+        new_msg = await insert("messages", {
+            "sender_id": current_user["id"],
+            "receiver_id": msg.receiver_id,
+            "content": msg.content
+        })
+    else:
+        raise HTTPException(status_code=400, detail="Either receiver_id or room_id must be provided")
     
     return {
         "id": new_msg["id"],
         "sender_id": new_msg["sender_id"],
-        "receiver_id": new_msg["receiver_id"],
+        "receiver_id": new_msg.get("receiver_id"),
+        "room_id": new_msg.get("room_id"),
         "content": new_msg["content"],
         "timestamp": new_msg["timestamp"]
     }
 
-@router.get("/{other_user_id}", response_model=List[MessageResponse])
-async def get_chat_history(other_user_id: UUID, current_user: dict = Depends(get_current_user)):
-    # Fetch messages between current_user and other_user_id in chronological order
-    q = """
-        SELECT * FROM messages 
-        WHERE (sender_id = $1 AND receiver_id = $2) 
-           OR (sender_id = $2 AND receiver_id = $1)
-        ORDER BY timestamp ASC
-    """
-    rows = await database.pool.fetch(q, current_user["id"], other_user_id)
+@router.get("/{id}", response_model=List[MessageResponse])
+async def get_chat_history(
+    id: UUID, 
+    is_room: bool = Query(False),
+    current_user: dict = Depends(get_current_user)
+):
+    if is_room:
+        q = """
+            SELECT m.*, u.username as sender_username 
+            FROM messages m
+            JOIN users u ON m.sender_id = u.id
+            WHERE m.room_id = $1
+            ORDER BY m.timestamp ASC
+        """
+        rows = await database.pool.fetch(q, id)
+    else:
+        q = """
+            SELECT m.*, u.username as sender_username 
+            FROM messages m
+            JOIN users u ON m.sender_id = u.id
+            WHERE (m.sender_id = $1 AND m.receiver_id = $2) 
+               OR (m.sender_id = $2 AND m.receiver_id = $1)
+            ORDER BY m.timestamp ASC
+        """
+        rows = await database.pool.fetch(q, current_user["id"], id)
     
-    return [
-        {
-            "id": row["id"],
-            "sender_id": row["sender_id"],
-            "receiver_id": row["receiver_id"],
-            "content": row["content"],
-            "timestamp": row["timestamp"]
-        }
-        for row in rows
-    ]
+    return [dict(row) for row in rows]

@@ -33,6 +33,7 @@ class ConnectionManager:
         self.active_room_connections: Dict[str, Set[WebSocket]] = {}
         # user_id -> websocket
         self.active_user_connections: Dict[str, WebSocket] = {}
+        self.active_user_rooms: Dict[str, str] = {}
 
     async def connect_room(self, websocket: WebSocket, room_id: str):
         await websocket.accept()
@@ -54,6 +55,11 @@ class ConnectionManager:
     def disconnect_user(self, user_id: str):
         if user_id in self.active_user_connections:
             del self.active_user_connections[user_id]
+        if user_id in self.active_user_rooms:
+            del self.active_user_rooms[user_id]
+
+    async def set_user_room(self, user_id: str, room_id: str):
+        self.active_user_rooms[user_id] = room_id
 
     async def broadcast_room(self, message: dict, room_id: str, exclude: WebSocket = None):
         if room_id in self.active_room_connections:
@@ -63,6 +69,12 @@ class ConnectionManager:
                         await connection.send_json(message)
                     except:
                         pass
+
+    async def broadcast_chat_to_room(self, message: dict, room_id: str, exclude_user_id: str = None):
+        # Broadcast to everyone currently viewing the room via their chat socket
+        for uid, rid in self.active_user_rooms.items():
+            if rid == room_id and uid != exclude_user_id:
+                await self.send_to_user(message, uid)
 
     async def send_to_user(self, message: dict, user_id: str):
         if user_id in self.active_user_connections:
@@ -87,15 +99,34 @@ async def websocket_room_endpoint(websocket: WebSocket, room_id: str):
 @app.websocket("/ws/chat/{user_id}")
 async def websocket_chat_endpoint(websocket: WebSocket, user_id: str):
     await manager.connect_user(websocket, user_id)
+    from app.crud import database
     try:
         while True:
-            # We mostly use this to receive messages for the user
-            # But the user could also send 1-to-1 messages here
             data = await websocket.receive_text()
             message = json.loads(data)
-            # format: {"type": "chat", "receiver_id": "...", "data": {...}}
+            
+            # Handle room presence
+            if message.get("type") == "join_room":
+                await manager.set_user_room(user_id, message.get("room_id"))
+                continue
+
+            # format: {"type": "chat", "receiver_id": "...", "room_id": "...", "data": {...}}
             if message.get("type") == "chat":
-                await manager.send_to_user(message, message["receiver_id"])
+                if message.get("room_id"):
+                    # Broadcast to everyone currently in the room (Active Presence)
+                    await manager.broadcast_chat_to_room(message, message["room_id"], exclude_user_id=user_id)
+                    
+                    # FALLBACK/PERSISTENCE: Also send to all formal room members who might be online but in different rooms
+                    q = "SELECT user_id FROM room_members WHERE room_id = $1"
+                    members = await database.pool.fetch(q, message["room_id"])
+                    for member in members:
+                        mid = str(member["user_id"])
+                        # Don't send twice if they are already in the room (broadcast_chat_to_room handled them)
+                        # and don't send to self
+                        if mid != user_id and mid not in manager.active_user_rooms:
+                            await manager.send_to_user(message, mid)
+                elif message.get("receiver_id"):
+                    await manager.send_to_user(message, message["receiver_id"])
     except WebSocketDisconnect:
         manager.disconnect_user(user_id)
 
