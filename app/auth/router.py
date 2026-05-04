@@ -124,3 +124,10 @@ async def get_users(current_user: dict = Depends(get_current_user)):
     from app.crud import database
     rows = await database.pool.fetch(q, current_user["id"])
     return [{"id": str(row["id"]), "username": row["username"]} for row in rows]
+
+@router.get("/users/search")
+async def search_users(q: str, current_user: dict = Depends(get_current_user)):
+    from app.crud import database
+    query = "SELECT id, username FROM users WHERE username ILIKE $1 AND id != $2 LIMIT 10"
+    rows = await database.pool.fetch(query, f"%{q}%", current_user["id"])
+    return [{"id": str(row["id"]), "username": row["username"]} for row in rows]
