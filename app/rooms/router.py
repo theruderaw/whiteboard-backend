@@ -4,7 +4,7 @@ from typing import List, Optional
 from uuid import UUID
 from datetime import datetime
 from app.auth.dependencies import get_current_user
-from app.crud import fetch_all, insert, database, fetch_one
+from app.crud import fetch_all, insert, fetch_one, update, delete
 
 router = APIRouter(prefix="/rooms", tags=["rooms"])
 
@@ -27,7 +27,9 @@ class RoomResponse(BaseModel):
 
 @router.get("/", response_model=List[RoomResponse])
 async def list_rooms(current_user: dict = Depends(get_current_user)):
-    # List all whiteboard rooms the user is a member of OR public rooms
+    # Note: Complex join queries still use database.pool.fetch in the original file
+    # but I will try to stick to crud.py if possible or replicate the original logic
+    from app import database
     q = """
         SELECT DISTINCT r.* 
         FROM rooms r
@@ -40,25 +42,19 @@ async def list_rooms(current_user: dict = Depends(get_current_user)):
 
 @router.post("/", response_model=RoomResponse)
 async def create_room(room: RoomCreate, current_user: dict = Depends(get_current_user)):
-    # Create a unified room
     new_room = await insert("rooms", {
         "name": room.name,
         "is_private": room.is_private
     })
-    
-    # Auto-create a whiteboard for the new room
     await insert("whiteboards", {
         "room_id": new_room["id"],
         "title": f"Whiteboard for {room.name}"
     })
-    
-    # Add creator as member
     await insert("room_members", {
         "room_id": new_room["id"],
         "user_id": current_user["id"],
         "role": "admin"
     })
-    
     return new_room
 
 class MemberResponse(BaseModel):
@@ -68,6 +64,7 @@ class MemberResponse(BaseModel):
 
 @router.get("/{room_id}/members", response_model=List[MemberResponse])
 async def list_members(room_id: UUID, current_user: dict = Depends(get_current_user)):
+    from app import database
     q = """
         SELECT rm.user_id, u.username, rm.role
         FROM room_members rm
@@ -79,34 +76,32 @@ async def list_members(room_id: UUID, current_user: dict = Depends(get_current_u
 
 @router.post("/{room_id}/members/{user_id}")
 async def add_member(room_id: UUID, user_id: UUID, current_user: dict = Depends(get_current_user)):
-    # Check if current_user is admin
-    admin_check = await database.pool.fetchrow(
-        "SELECT 1 FROM room_members WHERE room_id = $1 AND user_id = $2 AND role = 'admin'",
-        room_id, current_user["id"]
-    )
+    admin_check = await fetch_one("room_members", filters={"room_id": room_id, "user_id": current_user["id"], "role": "admin"})
     if not admin_check:
         raise HTTPException(status_code=403, detail="Only admins can add members")
-    
-    # Add member
-    await insert("room_members", {
-        "room_id": room_id,
-        "user_id": user_id,
-        "role": "member"
-    })
+    await insert("room_members", {"room_id": room_id, "user_id": user_id, "role": "member"})
     return {"status": "success"}
 
 @router.delete("/{room_id}/members/{user_id}")
 async def remove_member(room_id: UUID, user_id: UUID, current_user: dict = Depends(get_current_user)):
-    # Check if current_user is admin
-    admin_check = await database.pool.fetchrow(
-        "SELECT 1 FROM room_members WHERE room_id = $1 AND user_id = $2 AND role = 'admin'",
-        room_id, current_user["id"]
-    )
+    admin_check = await fetch_one("room_members", filters={"room_id": room_id, "user_id": current_user["id"], "role": "admin"})
     if not admin_check:
         raise HTTPException(status_code=403, detail="Only admins can remove members")
-    
-    await database.pool.execute(
-        "DELETE FROM room_members WHERE room_id = $1 AND user_id = $2",
-        room_id, user_id
-    )
+    await delete("room_members", filters={"room_id": room_id, "user_id": user_id})
+    return {"status": "success"}
+
+@router.patch("/{room_id}/members/{user_id}")
+async def update_member_role(room_id: UUID, user_id: UUID, role: str, current_user: dict = Depends(get_current_user)):
+    admin_check = await fetch_one("room_members", filters={"room_id": room_id, "user_id": current_user["id"], "role": "admin"})
+    if not admin_check:
+        raise HTTPException(status_code=403, detail="Only admins can change roles")
+    await update("room_members", data={"role": role}, filters={"room_id": room_id, "user_id": user_id})
+    return {"status": "success"}
+
+@router.delete("/{room_id}")
+async def delete_room(room_id: UUID, current_user: dict = Depends(get_current_user)):
+    admin_check = await fetch_one("room_members", filters={"room_id": room_id, "user_id": current_user["id"], "role": "admin"})
+    if not admin_check:
+        raise HTTPException(status_code=403, detail="Only admins can delete rooms")
+    await update("rooms", data={"active": False}, filters={"id": room_id})
     return {"status": "success"}
