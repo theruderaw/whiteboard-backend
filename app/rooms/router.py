@@ -62,6 +62,9 @@ class MemberResponse(BaseModel):
     username: str
     role: str
 
+class MemberRoleUpdate(BaseModel):
+    role: str
+
 @router.get("/{room_id}/members", response_model=List[MemberResponse])
 async def list_members(room_id: UUID, current_user: dict = Depends(get_current_user)):
     from app import database
@@ -105,3 +108,39 @@ async def delete_room(room_id: UUID, current_user: dict = Depends(get_current_us
         raise HTTPException(status_code=403, detail="Only admins can delete rooms")
     await update("rooms", data={"active": False}, filters={"id": room_id})
     return {"status": "success"}
+
+@router.patch("/{room_id}/members/{user_id}")
+async def update_member_role(room_id: UUID, user_id: UUID, update_data: MemberRoleUpdate, current_user: dict = Depends(get_current_user)):
+    # Check if current_user is admin
+    admin_check = await database.pool.fetchrow(
+        "SELECT 1 FROM room_members WHERE room_id = $1 AND user_id = $2 AND role = 'admin'",
+        room_id, current_user["id"]
+    )
+    if not admin_check:
+        raise HTTPException(status_code=403, detail="Only admins can update roles")
+    
+    if update_data.role not in ["admin", "member"]:
+        raise HTTPException(status_code=400, detail="Invalid role")
+        
+    # Get target member info
+    target_member = await database.pool.fetchrow(
+        "SELECT role FROM room_members WHERE room_id = $1 AND user_id = $2",
+        room_id, user_id
+    )
+    if not target_member:
+        raise HTTPException(status_code=404, detail="Member not found")
+        
+    # Safguard: Prevent demoting the last admin
+    if target_member["role"] == "admin" and update_data.role == "member":
+        admin_count = await database.pool.fetchval(
+            "SELECT COUNT(*) FROM room_members WHERE room_id = $1 AND role = 'admin'",
+            room_id
+        )
+        if admin_count <= 1:
+            raise HTTPException(status_code=400, detail="Cannot demote the last admin")
+            
+    await database.pool.execute(
+        "UPDATE room_members SET role = $1 WHERE room_id = $2 AND user_id = $3",
+        update_data.role, room_id, user_id
+    )
+    return {"status": "success", "role": update_data.role}
